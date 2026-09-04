@@ -149,6 +149,12 @@ INFO  Source=modbus  Status=Producing  Power=3400W  Meter reading=12345678Wh  Te
 To test without actually sending data to PVOutput: set `DRY_RUN=true` and
 restart - values will only be logged.
 
+By default, no update is sent to PVOutput while the inverter reports status
+**Sleeping** (`DATA_SOURCE=modbus` only - typically at night, no point
+uploading 0 W). Configure which statuses get skipped via `SKIP_STATUSES`
+(comma-separated, e.g. `SKIP_STATUSES=Sleeping,Off`); set it to an empty
+value to always upload regardless of status.
+
 ## Configuration options (`.env`)
 
 | Variable | Default | Description |
@@ -174,6 +180,7 @@ restart - values will only be logged.
 | `INTERVAL_SECONDS` | `300` | Seconds between uploads (PVOutput minimum without donation: 300) |
 | `PVOUTPUT_INCLUDE_TEMPERATURE` | `true` | Include temperature (`v5`) |
 | `PVOUTPUT_INCLUDE_VOLTAGE` | `true` | Include grid voltage (`v6`) |
+| `SKIP_STATUSES` | `Sleeping` | Comma-separated inverter statuses (Modbus only) to skip uploading for |
 | `TZ` | `Europe/Berlin` | Timezone for timestamps and Docker log times |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose Modbus logs |
 | `LOG_LANGUAGE` | `de` | Language of log messages: `de` (German) or `en` (English) |
@@ -200,8 +207,9 @@ restart - values will only be logged.
   [Run via Portainer](#run-via-portainer-git-repository-stack) above - use
   the stack's Environment variables instead of a `.env` file.
 - At night the inverter usually reports status "Off"/"Sleeping" with no
-  usable values - the container just keeps running and resumes reporting
-  once production is detected again.
+  usable values - by default, uploads are skipped entirely while status is
+  "Sleeping" (see `SKIP_STATUSES` above); the container just keeps running
+  and resumes uploading once production is detected again.
 
 ## Building your own image and publishing it to your Gitea registry
 

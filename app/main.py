@@ -85,6 +85,15 @@ class Config:
     LOG_LANGUAGE = os.environ.get("LOG_LANGUAGE", "de").strip().lower()
     DRY_RUN = _env_bool("DRY_RUN", False)
 
+    # Inverter-Status (Modbus), bei denen KEIN Update an PVOutput gesendet
+    # wird - Komma-getrennt, Gross-/Kleinschreibung egal. Standard:
+    # "Sleeping" (nachts) - kein Grund, dann Nullwerte an PVOutput zu senden.
+    SKIP_STATUSES = {
+        s.strip().lower()
+        for s in os.environ.get("SKIP_STATUSES", "Sleeping").split(",")
+        if s.strip()
+    }
+
 
 class DataSourceError(Exception):
     """Einheitlicher Fehler fuer beide Datenquellen (Modbus & Home Assistant)."""
@@ -112,6 +121,7 @@ MESSAGES = {
         "energy_missing": "Der Energie-Zaehlerstand konnte nicht gelesen werden",
         "status_unknown": "unbekannt",
         "status_log": "Quelle=%s  Status=%s  Leistung=%sW  Zaehlerstand=%.0fWh%s%s",
+        "status_skipped": "Status=%s - kein Update gesendet (siehe SKIP_STATUSES)",
         "temp_suffix": "  Temp=%sC",
         "voltage_suffix": "  U=%sV",
         "dry_run": "DRY_RUN aktiv - wuerde an PVOutput senden: %s",
@@ -154,6 +164,7 @@ MESSAGES = {
         "energy_missing": "The energy meter reading could not be read",
         "status_unknown": "unknown",
         "status_log": "Source=%s  Status=%s  Power=%sW  Meter reading=%.0fWh%s%s",
+        "status_skipped": "Status=%s - no update sent (see SKIP_STATUSES)",
         "temp_suffix": "  Temp=%sC",
         "voltage_suffix": "  U=%sV",
         "dry_run": "DRY_RUN active - would send to PVOutput: %s",
@@ -503,8 +514,12 @@ def main() -> None:
         cycle_start = time.monotonic()
         try:
             values = read_values()
-            payload = build_pvoutput_payload(values)
-            send_to_pvoutput(payload)
+            status_label = values.get("status_label")
+            if status_label and status_label.strip().lower() in Config.SKIP_STATUSES:
+                log.info(MSG["status_skipped"], status_label)
+            else:
+                payload = build_pvoutput_payload(values)
+                send_to_pvoutput(payload)
         except DataSourceError as exc:
             log.warning(str(exc))
         except ValueError as exc:
