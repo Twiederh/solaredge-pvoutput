@@ -55,10 +55,17 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-A successful cycle looks like this in the logs:
+A successful cycle looks like this in the logs (German by default; set
+`LOG_LANGUAGE=en` in `.env` for English log messages):
 
 ```
 INFO  Wechselrichter-Status=Producing  Leistung=3400W  Zaehlerstand=12345678Wh  Temp=41.2C  U=235.2V
+```
+
+With `LOG_LANGUAGE=en`:
+
+```
+INFO  Inverter status=Producing  Power=3400W  Meter reading=12345678Wh  Temp=41.2C  U=235.2V
 ```
 
 To test without actually sending data to PVOutput: set `DRY_RUN=true` in
@@ -79,6 +86,7 @@ To test without actually sending data to PVOutput: set `DRY_RUN=true` in
 | `PVOUTPUT_INCLUDE_VOLTAGE` | `true` | Include grid voltage (`v6`) |
 | `TZ` | `Europe/Berlin` | Timezone for timestamps and Docker log times |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose Modbus logs |
+| `LOG_LANGUAGE` | `de` | Language of log messages: `de` (German) or `en` (English) |
 | `DRY_RUN` | `false` | Only log values, don't send anything to PVOutput |
 
 ## Troubleshooting

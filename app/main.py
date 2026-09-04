@@ -2,12 +2,15 @@
 """
 solaredge-pvoutput
 -------------------
-Liest Leistungs- und Energiedaten eines SolarEdge-Wechselrichters (z.B. SE10K)
-lokal per Modbus TCP aus und sendet sie regelmaessig an PVOutput
-(https://pvoutput.org) via die addstatus.jsp-API.
+Reads power and energy data from a SolarEdge inverter (e.g. SE10K) locally
+via Modbus TCP and periodically uploads it to PVOutput
+(https://pvoutput.org) via the addstatus.jsp API.
 
-Voraussetzung: Am Wechselrichter muss "Modbus TCP" aktiviert sein
-(SetApp bzw. Display-Menue: Communication -> Modbus TCP -> Enable).
+Requirement: "Modbus TCP" must be enabled on the inverter
+(SetApp / display menu: Communication -> Modbus TCP -> Enable).
+
+Log messages can be switched between German and English via the
+LOG_LANGUAGE environment variable (values: "de" or "en", default "de").
 """
 
 import logging
@@ -58,10 +61,84 @@ class Config:
 
     TIMEZONE = os.environ.get("TZ", "Europe/Berlin")
     LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+    LOG_LANGUAGE = os.environ.get("LOG_LANGUAGE", "de").strip().lower()
     DRY_RUN = _env_bool("DRY_RUN", False)
 
     RETRY_DELAY_SECONDS = _env_int("RETRY_DELAY_SECONDS", 30)
 
+
+# --------------------------------------------------------------------------
+# Log-Texte / log strings (Deutsch + Englisch, siehe LOG_LANGUAGE)
+# --------------------------------------------------------------------------
+
+MESSAGES = {
+    "de": {
+        "invalid_interval": (
+            "INTERVAL_SECONDS=%s ist sehr niedrig - PVOutput erlaubt ohne "
+            "Donation-Account maximal ein Update alle 5 Minuten."
+        ),
+        "missing_env": "Fehlende Pflicht-Umgebungsvariablen: %s. Bitte .env pruefen.",
+        "unknown_tz": "Unbekannte Zeitzone %r, verwende UTC",
+        "unknown_log_language": (
+            "Unbekannte LOG_LANGUAGE=%r, verwende 'de' (gueltig: 'de', 'en')"
+        ),
+        "modbus_read_empty": "Keine Daten vom Wechselrichter erhalten (leere Antwort)",
+        "energy_missing": "energy_total konnte nicht gelesen werden",
+        "status_log": "Wechselrichter-Status=%s  Leistung=%sW  Zaehlerstand=%.0fWh%s%s",
+        "temp_suffix": "  Temp=%sC",
+        "voltage_suffix": "  U=%sV",
+        "dry_run": "DRY_RUN aktiv - wuerde an PVOutput senden: %s",
+        "pvoutput_http_error": "PVOutput antwortete mit HTTP %s: %s",
+        "pvoutput_ok": "PVOutput OK: %s",
+        "signal_received": "Signal %s empfangen, beende nach aktuellem Zyklus...",
+        "startup": (
+            "Starte solaredge-pvoutput: Inverter=%s:%s (Unit %s), "
+            "Intervall=%ss, TZ=%s"
+        ),
+        "modbus_conn_failed": "Modbus-Verbindung zum Wechselrichter fehlgeschlagen: %s",
+        "incomplete_data": "Unvollstaendige Daten vom Wechselrichter: %s",
+        "pvoutput_upload_failed": "PVOutput-Upload fehlgeschlagen: %s",
+        "unexpected_error": "Unerwarteter Fehler im Update-Zyklus",
+        "shutdown": "Beendet.",
+    },
+    "en": {
+        "invalid_interval": (
+            "INTERVAL_SECONDS=%s is very low - PVOutput allows a minimum of "
+            "one update every 5 minutes without a donation account."
+        ),
+        "missing_env": "Missing required environment variables: %s. Please check your .env file.",
+        "unknown_tz": "Unknown timezone %r, using UTC",
+        "unknown_log_language": (
+            "Unknown LOG_LANGUAGE=%r, using 'de' (valid: 'de', 'en')"
+        ),
+        "modbus_read_empty": "No data received from the inverter (empty response)",
+        "energy_missing": "energy_total could not be read",
+        "status_log": "Inverter status=%s  Power=%sW  Meter reading=%.0fWh%s%s",
+        "temp_suffix": "  Temp=%sC",
+        "voltage_suffix": "  U=%sV",
+        "dry_run": "DRY_RUN active - would send to PVOutput: %s",
+        "pvoutput_http_error": "PVOutput responded with HTTP %s: %s",
+        "pvoutput_ok": "PVOutput OK: %s",
+        "signal_received": "Received signal %s, shutting down after current cycle...",
+        "startup": (
+            "Starting solaredge-pvoutput: Inverter=%s:%s (Unit %s), "
+            "Interval=%ss, TZ=%s"
+        ),
+        "modbus_conn_failed": "Modbus connection to the inverter failed: %s",
+        "incomplete_data": "Incomplete data from the inverter: %s",
+        "pvoutput_upload_failed": "PVOutput upload failed: %s",
+        "unexpected_error": "Unexpected error during update cycle",
+        "shutdown": "Stopped.",
+    },
+}
+
+_raw_language = Config.LOG_LANGUAGE
+if _raw_language not in MESSAGES:
+    _log_language = "de"
+else:
+    _log_language = _raw_language
+
+MSG = MESSAGES[_log_language]
 
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
@@ -69,18 +146,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("solaredge-pvoutput")
 
-# pymodbus protokolliert jeden einzelnen Verbindungsversuch (inkl. der
-# internen Retries) als ERROR - das ist bei einem kurzzeitig nicht
-# erreichbaren Wechselrichter erwartetes Verhalten und wuerde die Logs
-# unnoetig fluten. Wir geben stattdessen selbst eine kompakte Warnung pro
-# Zyklus aus (siehe unten) und daempfen pymodbus, ausser bei LOG_LEVEL=DEBUG.
+if _raw_language not in MESSAGES:
+    log.warning(MSG["unknown_log_language"], _raw_language)
+
+# pymodbus logs every single connection attempt (including internal
+# retries) as ERROR - expected behaviour when the inverter is briefly
+# unreachable, and it would flood the logs. We emit our own compact warning
+# per cycle instead (see below) and dampen pymodbus unless LOG_LEVEL=DEBUG.
 if Config.LOG_LEVEL != "DEBUG":
     logging.getLogger("pymodbus").setLevel(logging.CRITICAL)
 
 try:
     TZ = ZoneInfo(Config.TIMEZONE)
 except Exception:
-    log.warning("Unbekannte Zeitzone %r, verwende UTC", Config.TIMEZONE)
+    log.warning(MSG["unknown_tz"], Config.TIMEZONE)
     TZ = ZoneInfo("UTC")
 
 INVERTER_STATUS_LABELS = {
@@ -104,17 +183,10 @@ def validate_config() -> None:
     if not Config.PVOUTPUT_SYSTEM_ID:
         missing.append("PVOUTPUT_SYSTEM_ID")
     if missing:
-        log.error(
-            "Fehlende Pflicht-Umgebungsvariablen: %s. Bitte .env pruefen.",
-            ", ".join(missing),
-        )
+        log.error(MSG["missing_env"], ", ".join(missing))
         sys.exit(1)
     if Config.INTERVAL_SECONDS < 60:
-        log.warning(
-            "INTERVAL_SECONDS=%s ist sehr niedrig - PVOutput erlaubt "
-            "ohne Donation-Account maximal ein Update alle 5 Minuten.",
-            Config.INTERVAL_SECONDS,
-        )
+        log.warning(MSG["invalid_interval"], Config.INTERVAL_SECONDS)
 
 
 def scaled(values: dict, key: str) -> float:
@@ -146,7 +218,7 @@ def read_inverter_values() -> dict:
             pass
 
     if not values:
-        raise ModbusIOException("Keine Daten vom Wechselrichter erhalten (leere Antwort)")
+        raise ModbusIOException(MSG["modbus_read_empty"])
 
     return values
 
@@ -158,7 +230,7 @@ def build_pvoutput_payload(values: dict) -> dict:
     status_raw = values.get("status")
 
     if energy_total is None:
-        raise ValueError("energy_total konnte nicht gelesen werden")
+        raise ValueError(MSG["energy_missing"])
 
     # Negative Momentanleistung (z.B. minimaler Nachtverbrauch des
     # Wechselrichters) ist fuer PVOutput nicht sinnvoll -> auf 0 clampen.
@@ -189,19 +261,19 @@ def build_pvoutput_payload(values: dict) -> dict:
 
     status_label = INVERTER_STATUS_LABELS.get(status_raw, f"unknown ({status_raw})")
     log.info(
-        "Wechselrichter-Status=%s  Leistung=%sW  Zaehlerstand=%.0fWh%s%s",
+        MSG["status_log"],
         status_label,
         payload.get("v2", "?"),
         energy_total,
-        f"  Temp={payload['v5']}C" if "v5" in payload else "",
-        f"  U={payload['v6']}V" if "v6" in payload else "",
+        (MSG["temp_suffix"] % payload["v5"]) if "v5" in payload else "",
+        (MSG["voltage_suffix"] % payload["v6"]) if "v6" in payload else "",
     )
     return payload
 
 
 def send_to_pvoutput(payload: dict) -> None:
     if Config.DRY_RUN:
-        log.info("DRY_RUN aktiv - wuerde an PVOutput senden: %s", payload)
+        log.info(MSG["dry_run"], payload)
         return
 
     headers = {
@@ -212,10 +284,8 @@ def send_to_pvoutput(payload: dict) -> None:
         Config.PVOUTPUT_URL, headers=headers, data=payload, timeout=15
     )
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"PVOutput antwortete mit HTTP {resp.status_code}: {resp.text.strip()}"
-        )
-    log.debug("PVOutput OK: %s", resp.text.strip())
+        raise RuntimeError(MSG["pvoutput_http_error"] % (resp.status_code, resp.text.strip()))
+    log.debug(MSG["pvoutput_ok"], resp.text.strip())
 
 
 class GracefulShutdown:
@@ -226,14 +296,14 @@ class GracefulShutdown:
         signal.signal(signal.SIGINT, self._handle)
 
     def _handle(self, signum, frame):
-        log.info("Signal %s empfangen, beende nach aktuellem Zyklus...", signum)
+        log.info(MSG["signal_received"], signum)
         self.stop = True
 
 
 def main() -> None:
     validate_config()
     log.info(
-        "Starte solaredge-pvoutput: Inverter=%s:%s (Unit %s), Intervall=%ss, TZ=%s",
+        MSG["startup"],
         Config.SOLAREDGE_HOST,
         Config.SOLAREDGE_PORT,
         Config.SOLAREDGE_UNIT_ID,
@@ -249,13 +319,13 @@ def main() -> None:
             payload = build_pvoutput_payload(values)
             send_to_pvoutput(payload)
         except (ConnectionException, ModbusIOException, OSError) as exc:
-            log.warning("Modbus-Verbindung zum Wechselrichter fehlgeschlagen: %s", exc)
+            log.warning(MSG["modbus_conn_failed"], exc)
         except ValueError as exc:
-            log.warning("Unvollstaendige Daten vom Wechselrichter: %s", exc)
+            log.warning(MSG["incomplete_data"], exc)
         except RuntimeError as exc:
-            log.error("PVOutput-Upload fehlgeschlagen: %s", exc)
+            log.error(MSG["pvoutput_upload_failed"], exc)
         except Exception:
-            log.exception("Unerwarteter Fehler im Update-Zyklus")
+            log.exception(MSG["unexpected_error"])
 
         elapsed = time.monotonic() - cycle_start
         remaining = max(Config.INTERVAL_SECONDS - elapsed, 1)
@@ -266,7 +336,7 @@ def main() -> None:
             time.sleep(step)
             slept += step
 
-    log.info("Beendet.")
+    log.info(MSG["shutdown"])
 
 
 if __name__ == "__main__":
