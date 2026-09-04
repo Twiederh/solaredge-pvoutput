@@ -1,108 +1,109 @@
 # solaredge-pvoutput
 
-Docker-Container, der einen SolarEdge-Wechselrichter (z.B. SE10K) lokal per
-**Modbus TCP** ausliest und die Werte alle 5 Minuten an **PVOutput**
-(https://pvoutput.org) sendet. Keine Cloud-API, keine Rate-Limits, funktioniert
-auch ohne Internetverbindung zu SolarEdge.
+Docker container that reads a SolarEdge inverter (e.g. SE10K) locally via
+**Modbus TCP** and uploads the values to **PVOutput**
+(https://pvoutput.org) every 5 minutes. No cloud API, no rate limits, and it
+keeps working even without an internet connection to SolarEdge.
 
-Gesendet werden:
+Values sent:
 
-- `v1` - Lifetime-Energieertrag in Wh (Zaehlerstand, `c1=1`) - PVOutput
-  berechnet daraus selbst die genaue Tagesenergie
-- `v2` - aktuelle AC-Leistung in W
-- `v5` - Wechselrichter-Temperatur (optional, abschaltbar)
-- `v6` - Netzspannung (optional, abschaltbar)
+- `v1` - lifetime energy yield in Wh (meter reading, `c1=1`) - PVOutput
+  calculates the accurate daily energy from this itself
+- `v2` - current AC power in W
+- `v5` - inverter temperature (optional, can be disabled)
+- `v6` - grid voltage (optional, can be disabled)
 
-## 1. Modbus TCP am Wechselrichter aktivieren
+## 1. Enable Modbus TCP on the inverter
 
-Am SE10K-Display oder in der SetApp:
+On the SE10K display or in the SetApp:
 
 `Communication -> Modbus TCP -> Enable`
 
-Danach den Wechselrichter neu starten. Der Wechselrichter muss aus dem
-Docker-Netzwerk heraus per IP erreichbar sein (Port standardmaessig **1502**).
+Then restart the inverter. The inverter must be reachable by IP from the
+Docker network (default port **1502**).
 
-> Hinweis: Wenn der Wechselrichter gleichzeitig an das SolarEdge-Monitoring-
-> Portal meldet, ist das kein Problem - Modbus TCP laeuft parallel dazu.
+> Note: If the inverter also reports to the SolarEdge monitoring portal at
+> the same time, that's fine - Modbus TCP runs in parallel to that.
 
-## 2. PVOutput vorbereiten
+## 2. Set up PVOutput
 
-1. Account auf https://pvoutput.org anlegen, System unter "Add Output"
-   registrieren.
-2. API-Key erzeugen: https://pvoutput.org/account.jsp -> "API Settings" ->
-   Access Key aktivieren.
-3. Die System-Id findest du in der URL deines Systems bzw. unter
-   "Settings" des jeweiligen Outputs.
+1. Create an account at https://pvoutput.org, register your system under
+   "Add Output".
+2. Generate an API key: https://pvoutput.org/account.jsp -> "API Settings" ->
+   enable Access Key.
+3. You'll find the System Id in your system's URL, or under "Settings" for
+   that output.
 
-## 3. Konfigurieren
+## 3. Configure
 
 ```bash
 cp .env.example .env
 ```
 
-`.env` bearbeiten und mindestens setzen:
+Edit `.env` and set at least:
 
 ```
-SOLAREDGE_HOST=192.168.1.50   # IP des Wechselrichters
+SOLAREDGE_HOST=192.168.1.50   # inverter IP address
 PVOUTPUT_API_KEY=...
 PVOUTPUT_SYSTEM_ID=...
 ```
 
-## 4. Starten
+## 4. Run
 
 ```bash
 docker compose up -d --build
 docker compose logs -f
 ```
 
-Ein erfolgreicher Durchlauf sieht in den Logs so aus:
+A successful cycle looks like this in the logs:
 
 ```
 INFO  Wechselrichter-Status=Producing  Leistung=3400W  Zaehlerstand=12345678Wh  Temp=41.2C  U=235.2V
 ```
 
-Zum Testen ohne tatsaechlich Daten an PVOutput zu senden: `DRY_RUN=true` in
-der `.env` setzen und neu starten - die Werte werden dann nur geloggt.
+To test without actually sending data to PVOutput: set `DRY_RUN=true` in
+`.env` and restart - values will only be logged.
 
-## Konfigurationsoptionen (`.env`)
+## Configuration options (`.env`)
 
-| Variable | Standard | Beschreibung |
+| Variable | Default | Description |
 |---|---|---|
-| `SOLAREDGE_HOST` | - (Pflicht) | IP/Hostname des Wechselrichters |
-| `SOLAREDGE_PORT` | `1502` | Modbus-TCP-Port |
-| `SOLAREDGE_UNIT_ID` | `1` | Modbus Unit/Slave-ID |
-| `SOLAREDGE_TIMEOUT` | `10` | Timeout pro Leseversuch (Sek.) |
-| `PVOUTPUT_API_KEY` | - (Pflicht) | PVOutput API-Key |
-| `PVOUTPUT_SYSTEM_ID` | - (Pflicht) | PVOutput System-Id |
-| `INTERVAL_SECONDS` | `300` | Sekunden zwischen Uploads (PVOutput-Minimum ohne Donation: 300) |
-| `PVOUTPUT_INCLUDE_TEMPERATURE` | `true` | Temperatur mitsenden (`v5`) |
-| `PVOUTPUT_INCLUDE_VOLTAGE` | `true` | Netzspannung mitsenden (`v6`) |
-| `TZ` | `Europe/Berlin` | Zeitzone fuer Zeitstempel und Docker-Log-Zeiten |
-| `LOG_LEVEL` | `INFO` | `DEBUG` fuer ausfuehrliche Modbus-Logs |
-| `DRY_RUN` | `false` | Werte nur loggen, nichts an PVOutput senden |
+| `SOLAREDGE_HOST` | - (required) | IP/hostname of the inverter |
+| `SOLAREDGE_PORT` | `1502` | Modbus TCP port |
+| `SOLAREDGE_UNIT_ID` | `1` | Modbus unit/slave ID |
+| `SOLAREDGE_TIMEOUT` | `10` | Timeout per read attempt (seconds) |
+| `PVOUTPUT_API_KEY` | - (required) | PVOutput API key |
+| `PVOUTPUT_SYSTEM_ID` | - (required) | PVOutput system ID |
+| `INTERVAL_SECONDS` | `300` | Seconds between uploads (PVOutput minimum without donation: 300) |
+| `PVOUTPUT_INCLUDE_TEMPERATURE` | `true` | Include temperature (`v5`) |
+| `PVOUTPUT_INCLUDE_VOLTAGE` | `true` | Include grid voltage (`v6`) |
+| `TZ` | `Europe/Berlin` | Timezone for timestamps and Docker log times |
+| `LOG_LEVEL` | `INFO` | `DEBUG` for verbose Modbus logs |
+| `DRY_RUN` | `false` | Only log values, don't send anything to PVOutput |
 
 ## Troubleshooting
 
-- **"Modbus-Verbindung zum Wechselrichter fehlgeschlagen"**: IP/Port prüfen,
-  Modbus TCP am Wechselrichter aktiviert? Firewall zwischen Docker-Host und
-  Wechselrichter offen? Manche Router isolieren IoT-/Gast-VLANs.
-- **"Unvollstaendige Daten vom Wechselrichter"**: Wechselrichter antwortet,
-  liefert aber unvollstaendige Register - meist ein Uebergangszustand direkt
-  nach dem Einschalten. Wird im naechsten Zyklus automatisch erneut versucht.
-- **"PVOutput-Upload fehlgeschlagen: HTTP 403"**: API-Key oder System-Id
-  falsch, oder Rate-Limit erreicht (Uploads < 5 Min. Abstand ohne Donation).
-- Nachts liefert der Wechselrichter meist Status "Off"/"Sleeping" und keine
-  verwertbaren Werte mehr - der Container laeuft einfach weiter und meldet
-  sich, sobald wieder Produktion erkannt wird.
+- **"Modbus connection to the inverter failed"**: Check IP/port. Is Modbus
+  TCP enabled on the inverter? Is there a firewall between the Docker host
+  and the inverter? Some routers isolate IoT/guest VLANs.
+- **"Incomplete data from the inverter"**: The inverter responds but returns
+  incomplete registers - usually a transient state right after power-on.
+  Automatically retried on the next cycle.
+- **"PVOutput upload failed: HTTP 403"**: Wrong API key or system ID, or
+  rate limit reached (uploads faster than 5 minutes apart without a
+  donation account).
+- At night the inverter usually reports status "Off"/"Sleeping" with no
+  usable values - the container just keeps running and resumes reporting
+  once production is detected again.
 
-## Eigenes Image bauen und in Gitea-Registry veroeffentlichen
+## Building your own image and publishing it to your Gitea registry
 
-Passend zu deinem bestehenden Setup (z.B. wie bei `go-e-solar-charger`) kannst
-du das Image auch in deine Gitea-Registry pushen:
+Matching your existing setup (e.g. as with `go-e-solar-charger`), you can
+also push the image to your Gitea registry:
 
 ```bash
 docker build -t gitea.wiederhol.de/twiederh/solaredge-pvoutput:latest .
 docker push gitea.wiederhol.de/twiederh/solaredge-pvoutput:latest
 ```
 
-und in der `docker-compose.yml` dann `image:` statt `build:` verwenden.
+and then use `image:` instead of `build:` in `docker-compose.yml`.
