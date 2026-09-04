@@ -5,8 +5,40 @@ services:
     # image: gitea.wiederhol.de/twiederh/solaredge-pvoutput:latest
     container_name: solaredge-pvoutput
     restart: unless-stopped
-    env_file:
-      - .env
+    # Werte kommen ueber Variablen-Interpolation (${VAR}) statt "env_file",
+    # damit der Stack auch ohne eine physische .env-Datei im Compose-Ordner
+    # deploybar ist (z.B. Portainer "Git repository"-Stacks). Lokal per
+    # "docker compose up" liest Compose die Werte automatisch aus einer
+    # .env-Datei im selben Verzeichnis (siehe .env.example); in Portainer
+    # traegst du dieselben Variablen unter "Environment variables" der
+    # Stack-Konfiguration ein.
+    environment:
+      DATA_SOURCE: ${DATA_SOURCE:-modbus}
+
+      SOLAREDGE_HOST: ${SOLAREDGE_HOST:-}
+      SOLAREDGE_PORT: ${SOLAREDGE_PORT:-1502}
+      SOLAREDGE_UNIT_ID: ${SOLAREDGE_UNIT_ID:-1}
+      SOLAREDGE_TIMEOUT: ${SOLAREDGE_TIMEOUT:-10}
+
+      HOMEASSISTANT_URL: ${HOMEASSISTANT_URL:-}
+      HOMEASSISTANT_TOKEN: ${HOMEASSISTANT_TOKEN:-}
+      HOMEASSISTANT_TIMEOUT: ${HOMEASSISTANT_TIMEOUT:-10}
+      HA_ENTITY_POWER: ${HA_ENTITY_POWER:-}
+      HA_ENTITY_ENERGY_TOTAL: ${HA_ENTITY_ENERGY_TOTAL:-}
+      HA_ENTITY_TEMPERATURE: ${HA_ENTITY_TEMPERATURE:-}
+      HA_ENTITY_VOLTAGE: ${HA_ENTITY_VOLTAGE:-}
+
+      PVOUTPUT_API_KEY: ${PVOUTPUT_API_KEY:?PVOUTPUT_API_KEY muss gesetzt sein}
+      PVOUTPUT_SYSTEM_ID: ${PVOUTPUT_SYSTEM_ID:?PVOUTPUT_SYSTEM_ID muss gesetzt sein}
+
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-300}
+      PVOUTPUT_INCLUDE_TEMPERATURE: ${PVOUTPUT_INCLUDE_TEMPERATURE:-true}
+      PVOUTPUT_INCLUDE_VOLTAGE: ${PVOUTPUT_INCLUDE_VOLTAGE:-true}
+
+      TZ: ${TZ:-Europe/Berlin}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_LANGUAGE: ${LOG_LANGUAGE:-de}
+      DRY_RUN: ${DRY_RUN:-false}
     logging:
       driver: json-file
       options:

@@ -2,12 +2,23 @@
 """
 solaredge-pvoutput
 -------------------
-Reads power and energy data from a SolarEdge inverter (e.g. SE10K) locally
-via Modbus TCP and periodically uploads it to PVOutput
-(https://pvoutput.org) via the addstatus.jsp API.
+Reads power and energy data from a SolarEdge inverter (e.g. SE10K) and
+periodically uploads it to PVOutput (https://pvoutput.org) via the
+addstatus.jsp API.
 
-Requirement: "Modbus TCP" must be enabled on the inverter
-(SetApp / display menu: Communication -> Modbus TCP -> Enable).
+Two data sources are supported (DATA_SOURCE env var):
+
+- "modbus" (default): connects directly to the inverter via Modbus TCP.
+  Requires "Modbus TCP" to be enabled on the inverter (SetApp / display
+  menu: Communication -> Modbus TCP -> Enable). Note: most SolarEdge
+  inverters only accept one active Modbus TCP connection at a time - if
+  something else (e.g. Home Assistant's Modbus integration) is already
+  polling the inverter, use "homeassistant" instead.
+- "homeassistant": reads the values from existing Home Assistant sensor
+  entities via the HA REST API instead of talking to the inverter
+  directly. Use this if Home Assistant already has a Modbus (or any
+  other) integration polling the inverter, to avoid two clients
+  competing for the same connection.
 
 Log messages can be switched between German and English via the
 LOG_LANGUAGE environment variable (values: "de" or "en", default "de").
@@ -23,7 +34,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from pymodbus.exceptions import ConnectionException, ModbusIOException
-from solaredge_modbus import Inverter, inverterStatus
+from solaredge_modbus import Inverter
 
 # --------------------------------------------------------------------------
 # Konfiguration (ueber Umgebungsvariablen, siehe .env.example)
@@ -44,10 +55,20 @@ def _env_int(name: str, default: int) -> int:
 
 
 class Config:
+    DATA_SOURCE = os.environ.get("DATA_SOURCE", "modbus").strip().lower()
+
     SOLAREDGE_HOST = os.environ.get("SOLAREDGE_HOST", "").strip()
     SOLAREDGE_PORT = _env_int("SOLAREDGE_PORT", 1502)
     SOLAREDGE_UNIT_ID = _env_int("SOLAREDGE_UNIT_ID", 1)
     SOLAREDGE_TIMEOUT = _env_int("SOLAREDGE_TIMEOUT", 10)
+
+    HOMEASSISTANT_URL = os.environ.get("HOMEASSISTANT_URL", "").strip().rstrip("/")
+    HOMEASSISTANT_TOKEN = os.environ.get("HOMEASSISTANT_TOKEN", "").strip()
+    HOMEASSISTANT_TIMEOUT = _env_int("HOMEASSISTANT_TIMEOUT", 10)
+    HA_ENTITY_POWER = os.environ.get("HA_ENTITY_POWER", "").strip()
+    HA_ENTITY_ENERGY_TOTAL = os.environ.get("HA_ENTITY_ENERGY_TOTAL", "").strip()
+    HA_ENTITY_TEMPERATURE = os.environ.get("HA_ENTITY_TEMPERATURE", "").strip()
+    HA_ENTITY_VOLTAGE = os.environ.get("HA_ENTITY_VOLTAGE", "").strip()
 
     PVOUTPUT_API_KEY = os.environ.get("PVOUTPUT_API_KEY", "").strip()
     PVOUTPUT_SYSTEM_ID = os.environ.get("PVOUTPUT_SYSTEM_ID", "").strip()
@@ -64,7 +85,9 @@ class Config:
     LOG_LANGUAGE = os.environ.get("LOG_LANGUAGE", "de").strip().lower()
     DRY_RUN = _env_bool("DRY_RUN", False)
 
-    RETRY_DELAY_SECONDS = _env_int("RETRY_DELAY_SECONDS", 30)
+
+class DataSourceError(Exception):
+    """Einheitlicher Fehler fuer beide Datenquellen (Modbus & Home Assistant)."""
 
 
 # --------------------------------------------------------------------------
@@ -78,25 +101,38 @@ MESSAGES = {
             "Donation-Account maximal ein Update alle 5 Minuten."
         ),
         "missing_env": "Fehlende Pflicht-Umgebungsvariablen: %s. Bitte .env pruefen.",
+        "invalid_data_source": (
+            "DATA_SOURCE=%r ist ungueltig - erlaubt sind 'modbus' oder 'homeassistant'."
+        ),
         "unknown_tz": "Unbekannte Zeitzone %r, verwende UTC",
         "unknown_log_language": (
             "Unbekannte LOG_LANGUAGE=%r, verwende 'de' (gueltig: 'de', 'en')"
         ),
         "modbus_read_empty": "Keine Daten vom Wechselrichter erhalten (leere Antwort)",
-        "energy_missing": "energy_total konnte nicht gelesen werden",
-        "status_log": "Wechselrichter-Status=%s  Leistung=%sW  Zaehlerstand=%.0fWh%s%s",
+        "energy_missing": "Der Energie-Zaehlerstand konnte nicht gelesen werden",
+        "status_unknown": "unbekannt",
+        "status_log": "Quelle=%s  Status=%s  Leistung=%sW  Zaehlerstand=%.0fWh%s%s",
         "temp_suffix": "  Temp=%sC",
         "voltage_suffix": "  U=%sV",
         "dry_run": "DRY_RUN aktiv - wuerde an PVOutput senden: %s",
         "pvoutput_http_error": "PVOutput antwortete mit HTTP %s: %s",
         "pvoutput_ok": "PVOutput OK: %s",
         "signal_received": "Signal %s empfangen, beende nach aktuellem Zyklus...",
-        "startup": (
-            "Starte solaredge-pvoutput: Inverter=%s:%s (Unit %s), "
+        "startup_modbus": (
+            "Starte solaredge-pvoutput: Quelle=Modbus TCP %s:%s (Unit %s), "
+            "Intervall=%ss, TZ=%s"
+        ),
+        "startup_ha": (
+            "Starte solaredge-pvoutput: Quelle=Home Assistant %s, "
             "Intervall=%ss, TZ=%s"
         ),
         "modbus_conn_failed": "Modbus-Verbindung zum Wechselrichter fehlgeschlagen: %s",
-        "incomplete_data": "Unvollstaendige Daten vom Wechselrichter: %s",
+        "ha_entity_not_found": "Home-Assistant-Entity %r nicht gefunden (HTTP 404)",
+        "ha_http_error": "Home-Assistant-Anfrage fuer %r fehlgeschlagen: HTTP %s",
+        "ha_entity_unavailable": "Home-Assistant-Entity %r ist aktuell 'unavailable'/'unknown'",
+        "ha_entity_not_numeric": "Home-Assistant-Entity %r liefert keinen Zahlenwert (%r)",
+        "ha_request_failed": "Verbindung zu Home Assistant fehlgeschlagen: %s",
+        "incomplete_data": "Unvollstaendige Daten von der Datenquelle: %s",
         "pvoutput_upload_failed": "PVOutput-Upload fehlgeschlagen: %s",
         "unexpected_error": "Unerwarteter Fehler im Update-Zyklus",
         "shutdown": "Beendet.",
@@ -107,25 +143,38 @@ MESSAGES = {
             "one update every 5 minutes without a donation account."
         ),
         "missing_env": "Missing required environment variables: %s. Please check your .env file.",
+        "invalid_data_source": (
+            "DATA_SOURCE=%r is invalid - allowed values are 'modbus' or 'homeassistant'."
+        ),
         "unknown_tz": "Unknown timezone %r, using UTC",
         "unknown_log_language": (
             "Unknown LOG_LANGUAGE=%r, using 'de' (valid: 'de', 'en')"
         ),
         "modbus_read_empty": "No data received from the inverter (empty response)",
-        "energy_missing": "energy_total could not be read",
-        "status_log": "Inverter status=%s  Power=%sW  Meter reading=%.0fWh%s%s",
+        "energy_missing": "The energy meter reading could not be read",
+        "status_unknown": "unknown",
+        "status_log": "Source=%s  Status=%s  Power=%sW  Meter reading=%.0fWh%s%s",
         "temp_suffix": "  Temp=%sC",
         "voltage_suffix": "  U=%sV",
         "dry_run": "DRY_RUN active - would send to PVOutput: %s",
         "pvoutput_http_error": "PVOutput responded with HTTP %s: %s",
         "pvoutput_ok": "PVOutput OK: %s",
         "signal_received": "Received signal %s, shutting down after current cycle...",
-        "startup": (
-            "Starting solaredge-pvoutput: Inverter=%s:%s (Unit %s), "
+        "startup_modbus": (
+            "Starting solaredge-pvoutput: Source=Modbus TCP %s:%s (Unit %s), "
+            "Interval=%ss, TZ=%s"
+        ),
+        "startup_ha": (
+            "Starting solaredge-pvoutput: Source=Home Assistant %s, "
             "Interval=%ss, TZ=%s"
         ),
         "modbus_conn_failed": "Modbus connection to the inverter failed: %s",
-        "incomplete_data": "Incomplete data from the inverter: %s",
+        "ha_entity_not_found": "Home Assistant entity %r not found (HTTP 404)",
+        "ha_http_error": "Home Assistant request for %r failed: HTTP %s",
+        "ha_entity_unavailable": "Home Assistant entity %r is currently 'unavailable'/'unknown'",
+        "ha_entity_not_numeric": "Home Assistant entity %r did not return a numeric value (%r)",
+        "ha_request_failed": "Connection to Home Assistant failed: %s",
+        "incomplete_data": "Incomplete data from the data source: %s",
         "pvoutput_upload_failed": "PVOutput upload failed: %s",
         "unexpected_error": "Unexpected error during update cycle",
         "shutdown": "Stopped.",
@@ -133,11 +182,7 @@ MESSAGES = {
 }
 
 _raw_language = Config.LOG_LANGUAGE
-if _raw_language not in MESSAGES:
-    _log_language = "de"
-else:
-    _log_language = _raw_language
-
+_log_language = _raw_language if _raw_language in MESSAGES else "de"
 MSG = MESSAGES[_log_language]
 
 logging.basicConfig(
@@ -175,13 +220,27 @@ INVERTER_STATUS_LABELS = {
 
 
 def validate_config() -> None:
+    if Config.DATA_SOURCE not in ("modbus", "homeassistant"):
+        log.error(MSG["invalid_data_source"], Config.DATA_SOURCE)
+        sys.exit(1)
+
     missing = []
-    if not Config.SOLAREDGE_HOST:
-        missing.append("SOLAREDGE_HOST")
     if not Config.PVOUTPUT_API_KEY:
         missing.append("PVOUTPUT_API_KEY")
     if not Config.PVOUTPUT_SYSTEM_ID:
         missing.append("PVOUTPUT_SYSTEM_ID")
+
+    if Config.DATA_SOURCE == "modbus":
+        if not Config.SOLAREDGE_HOST:
+            missing.append("SOLAREDGE_HOST")
+    else:  # homeassistant
+        if not Config.HOMEASSISTANT_URL:
+            missing.append("HOMEASSISTANT_URL")
+        if not Config.HOMEASSISTANT_TOKEN:
+            missing.append("HOMEASSISTANT_TOKEN")
+        if not Config.HA_ENTITY_ENERGY_TOTAL:
+            missing.append("HA_ENTITY_ENERGY_TOTAL")
+
     if missing:
         log.error(MSG["missing_env"], ", ".join(missing))
         sys.exit(1)
@@ -189,7 +248,11 @@ def validate_config() -> None:
         log.warning(MSG["invalid_interval"], Config.INTERVAL_SECONDS)
 
 
-def scaled(values: dict, key: str) -> float:
+# --------------------------------------------------------------------------
+# Datenquelle 1: Modbus TCP direkt am Wechselrichter
+# --------------------------------------------------------------------------
+
+def _modbus_scaled(values: dict, key: str) -> float:
     """Wendet den SunSpec-Skalierungsfaktor auf einen rohen Registerwert an."""
     raw = values.get(key)
     scale = values.get(f"{key}_scale")
@@ -200,9 +263,9 @@ def scaled(values: dict, key: str) -> float:
     return float(raw) * (10 ** scale)
 
 
-def read_inverter_values() -> dict:
+def read_values_modbus() -> dict:
     """Baut eine frische Modbus-Verbindung auf, liest alle Register und
-    schliesst die Verbindung wieder. Wirft eine Exception bei Fehlern."""
+    schliesst die Verbindung wieder."""
     inverter = Inverter(
         host=Config.SOLAREDGE_HOST,
         port=Config.SOLAREDGE_PORT,
@@ -211,6 +274,8 @@ def read_inverter_values() -> dict:
     )
     try:
         values = inverter.read_all()
+    except (ConnectionException, ModbusIOException, OSError) as exc:
+        raise DataSourceError(MSG["modbus_conn_failed"] % exc) from exc
     finally:
         try:
             inverter.disconnect()
@@ -218,53 +283,167 @@ def read_inverter_values() -> dict:
             pass
 
     if not values:
-        raise ModbusIOException(MSG["modbus_read_empty"])
+        raise DataSourceError(MSG["modbus_read_empty"])
 
-    return values
+    power_w = _modbus_scaled(values, "power_ac")
+    energy_wh = _modbus_scaled(values, "energy_total")
+    temperature_c = (
+        _modbus_scaled(values, "temperature") if Config.INCLUDE_TEMPERATURE else None
+    )
 
+    voltage_v = None
+    if Config.INCLUDE_VOLTAGE:
+        for key in ("l1_voltage", "l1n_voltage"):
+            v = _modbus_scaled(values, key)
+            if v:
+                voltage_v = v
+                break
+
+    status_raw = values.get("status")
+    status_label = INVERTER_STATUS_LABELS.get(status_raw, f"unknown ({status_raw})")
+
+    return {
+        "power_w": power_w,
+        "energy_wh": energy_wh,
+        "temperature_c": temperature_c,
+        "voltage_v": voltage_v,
+        "status_label": status_label,
+    }
+
+
+# --------------------------------------------------------------------------
+# Datenquelle 2: Home Assistant (liest bestehende Sensor-Entities aus)
+# --------------------------------------------------------------------------
+
+def _ha_get_state(entity_id: str) -> tuple:
+    """Liest eine einzelne Entity aus der Home-Assistant-REST-API.
+    Gibt (Wert als float, unit_of_measurement) zurueck."""
+    url = f"{Config.HOMEASSISTANT_URL}/api/states/{entity_id}"
+    headers = {
+        "Authorization": f"Bearer {Config.HOMEASSISTANT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=Config.HOMEASSISTANT_TIMEOUT)
+    except requests.RequestException as exc:
+        raise DataSourceError(MSG["ha_request_failed"] % exc) from exc
+
+    if resp.status_code == 404:
+        raise DataSourceError(MSG["ha_entity_not_found"] % entity_id)
+    if resp.status_code != 200:
+        raise DataSourceError(MSG["ha_http_error"] % (entity_id, resp.status_code))
+
+    data = resp.json()
+    state = data.get("state")
+    if state in (None, "unknown", "unavailable"):
+        raise DataSourceError(MSG["ha_entity_unavailable"] % entity_id)
+    try:
+        value = float(state)
+    except (TypeError, ValueError) as exc:
+        raise DataSourceError(MSG["ha_entity_not_numeric"] % (entity_id, state)) from exc
+
+    unit = (data.get("attributes") or {}).get("unit_of_measurement", "") or ""
+    return value, unit
+
+
+def _ha_to_watts(value: float, unit: str) -> float:
+    u = unit.strip().lower()
+    if u == "kw":
+        return value * 1_000
+    if u == "mw":
+        return value * 1_000_000
+    return value  # bereits W, oder keine Einheit angegeben
+
+
+def _ha_to_watthours(value: float, unit: str) -> float:
+    u = unit.strip().lower()
+    if u == "kwh":
+        return value * 1_000
+    if u == "mwh":
+        return value * 1_000_000
+    return value  # bereits Wh
+
+
+def _ha_to_celsius(value: float, unit: str) -> float:
+    u = unit.strip().lower()
+    if u in ("°f", "f"):
+        return (value - 32) * 5 / 9
+    return value  # bereits Grad Celsius, oder keine Einheit angegeben
+
+
+def read_values_homeassistant() -> dict:
+    power_w = None
+    if Config.HA_ENTITY_POWER:
+        value, unit = _ha_get_state(Config.HA_ENTITY_POWER)
+        power_w = _ha_to_watts(value, unit)
+
+    energy_value, energy_unit = _ha_get_state(Config.HA_ENTITY_ENERGY_TOTAL)
+    energy_wh = _ha_to_watthours(energy_value, energy_unit)
+
+    temperature_c = None
+    if Config.INCLUDE_TEMPERATURE and Config.HA_ENTITY_TEMPERATURE:
+        value, unit = _ha_get_state(Config.HA_ENTITY_TEMPERATURE)
+        temperature_c = _ha_to_celsius(value, unit)
+
+    voltage_v = None
+    if Config.INCLUDE_VOLTAGE and Config.HA_ENTITY_VOLTAGE:
+        value, _unit = _ha_get_state(Config.HA_ENTITY_VOLTAGE)
+        voltage_v = value
+
+    return {
+        "power_w": power_w,
+        "energy_wh": energy_wh,
+        "temperature_c": temperature_c,
+        "voltage_v": voltage_v,
+        "status_label": None,
+    }
+
+
+def read_values() -> dict:
+    if Config.DATA_SOURCE == "homeassistant":
+        return read_values_homeassistant()
+    return read_values_modbus()
+
+
+# --------------------------------------------------------------------------
+# PVOutput
+# --------------------------------------------------------------------------
 
 def build_pvoutput_payload(values: dict) -> dict:
-    power_ac = scaled(values, "power_ac")
-    energy_total = scaled(values, "energy_total")
-    temperature = scaled(values, "temperature") if Config.INCLUDE_TEMPERATURE else None
-    status_raw = values.get("status")
+    power_w = values.get("power_w")
+    energy_wh = values.get("energy_wh")
+    temperature_c = values.get("temperature_c")
+    voltage_v = values.get("voltage_v")
+    status_label = values.get("status_label") or MSG["status_unknown"]
 
-    if energy_total is None:
+    if energy_wh is None:
         raise ValueError(MSG["energy_missing"])
 
     # Negative Momentanleistung (z.B. minimaler Nachtverbrauch des
     # Wechselrichters) ist fuer PVOutput nicht sinnvoll -> auf 0 clampen.
-    if power_ac is not None and power_ac < 0:
-        power_ac = 0
-
-    voltage = None
-    if Config.INCLUDE_VOLTAGE:
-        for key in ("l1_voltage", "l1n_voltage"):
-            v = scaled(values, key)
-            if v:
-                voltage = v
-                break
+    if power_w is not None and power_w < 0:
+        power_w = 0
 
     now = datetime.now(TZ)
     payload = {
         "d": now.strftime("%Y%m%d"),
         "t": now.strftime("%H:%M"),
-        "v1": int(round(energy_total)),  # Lifetime-Energie in Wh
+        "v1": int(round(energy_wh)),  # Lifetime-Energie in Wh
         "c1": 1,  # v1 ist ein Zaehlerstand -> PVOutput berechnet die Differenz
     }
-    if power_ac is not None:
-        payload["v2"] = int(round(power_ac))
-    if temperature:
-        payload["v5"] = round(temperature, 1)
-    if voltage:
-        payload["v6"] = round(voltage, 1)
+    if power_w is not None:
+        payload["v2"] = int(round(power_w))
+    if temperature_c:
+        payload["v5"] = round(temperature_c, 1)
+    if voltage_v:
+        payload["v6"] = round(voltage_v, 1)
 
-    status_label = INVERTER_STATUS_LABELS.get(status_raw, f"unknown ({status_raw})")
     log.info(
         MSG["status_log"],
+        Config.DATA_SOURCE,
         status_label,
         payload.get("v2", "?"),
-        energy_total,
+        energy_wh,
         (MSG["temp_suffix"] % payload["v5"]) if "v5" in payload else "",
         (MSG["voltage_suffix"] % payload["v6"]) if "v6" in payload else "",
     )
@@ -302,24 +481,32 @@ class GracefulShutdown:
 
 def main() -> None:
     validate_config()
-    log.info(
-        MSG["startup"],
-        Config.SOLAREDGE_HOST,
-        Config.SOLAREDGE_PORT,
-        Config.SOLAREDGE_UNIT_ID,
-        Config.INTERVAL_SECONDS,
-        Config.TIMEZONE,
-    )
+    if Config.DATA_SOURCE == "homeassistant":
+        log.info(
+            MSG["startup_ha"],
+            Config.HOMEASSISTANT_URL,
+            Config.INTERVAL_SECONDS,
+            Config.TIMEZONE,
+        )
+    else:
+        log.info(
+            MSG["startup_modbus"],
+            Config.SOLAREDGE_HOST,
+            Config.SOLAREDGE_PORT,
+            Config.SOLAREDGE_UNIT_ID,
+            Config.INTERVAL_SECONDS,
+            Config.TIMEZONE,
+        )
     shutdown = GracefulShutdown()
 
     while not shutdown.stop:
         cycle_start = time.monotonic()
         try:
-            values = read_inverter_values()
+            values = read_values()
             payload = build_pvoutput_payload(values)
             send_to_pvoutput(payload)
-        except (ConnectionException, ModbusIOException, OSError) as exc:
-            log.warning(MSG["modbus_conn_failed"], exc)
+        except DataSourceError as exc:
+            log.warning(str(exc))
         except ValueError as exc:
             log.warning(MSG["incomplete_data"], exc)
         except RuntimeError as exc:
