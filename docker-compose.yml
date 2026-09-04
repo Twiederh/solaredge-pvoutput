@@ -1,0 +1,14 @@
+services:
+  solaredge-pvoutput:
+    build: .
+    # Alternativ, sobald das Image z.B. in deiner Gitea-Registry liegt:
+    # image: gitea.wiederhol.de/twiederh/solaredge-pvoutput:latest
+    container_name: solaredge-pvoutput
+    restart: unless-stopped
+    env_file:
+      - .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

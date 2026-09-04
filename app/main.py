@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+solaredge-pvoutput
+-------------------
+Liest Leistungs- und Energiedaten eines SolarEdge-Wechselrichters (z.B. SE10K)
+lokal per Modbus TCP aus und sendet sie regelmaessig an PVOutput
+(https://pvoutput.org) via die addstatus.jsp-API.
+
+Voraussetzung: Am Wechselrichter muss "Modbus TCP" aktiviert sein
+(SetApp bzw. Display-Menue: Communication -> Modbus TCP -> Enable).
+"""
+
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
+from pymodbus.exceptions import ConnectionException, ModbusIOException
+from solaredge_modbus import Inverter, inverterStatus
+
+# --------------------------------------------------------------------------
+# Konfiguration (ueber Umgebungsvariablen, siehe .env.example)
+# --------------------------------------------------------------------------
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return int(val)
+
+
+class Config:
+    SOLAREDGE_HOST = os.environ.get("SOLAREDGE_HOST", "").strip()
+    SOLAREDGE_PORT = _env_int("SOLAREDGE_PORT", 1502)
+    SOLAREDGE_UNIT_ID = _env_int("SOLAREDGE_UNIT_ID", 1)
+    SOLAREDGE_TIMEOUT = _env_int("SOLAREDGE_TIMEOUT", 10)
+
+    PVOUTPUT_API_KEY = os.environ.get("PVOUTPUT_API_KEY", "").strip()
+    PVOUTPUT_SYSTEM_ID = os.environ.get("PVOUTPUT_SYSTEM_ID", "").strip()
+    PVOUTPUT_URL = os.environ.get(
+        "PVOUTPUT_URL", "https://pvoutput.org/service/r2/addstatus.jsp"
+    )
+
+    INTERVAL_SECONDS = _env_int("INTERVAL_SECONDS", 300)  # 5 Minuten
+    INCLUDE_TEMPERATURE = _env_bool("PVOUTPUT_INCLUDE_TEMPERATURE", True)
+    INCLUDE_VOLTAGE = _env_bool("PVOUTPUT_INCLUDE_VOLTAGE", True)
+
+    TIMEZONE = os.environ.get("TZ", "Europe/Berlin")
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+    DRY_RUN = _env_bool("DRY_RUN", False)
+
+    RETRY_DELAY_SECONDS = _env_int("RETRY_DELAY_SECONDS", 30)
+
+
+logging.basicConfig(
+    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-8s %(message)s",
+)
+log = logging.getLogger("solaredge-pvoutput")
+
+# pymodbus protokolliert jeden einzelnen Verbindungsversuch (inkl. der
+# internen Retries) als ERROR - das ist bei einem kurzzeitig nicht
+# erreichbaren Wechselrichter erwartetes Verhalten und wuerde die Logs
+# unnoetig fluten. Wir geben stattdessen selbst eine kompakte Warnung pro
+# Zyklus aus (siehe unten) und daempfen pymodbus, ausser bei LOG_LEVEL=DEBUG.
+if Config.LOG_LEVEL != "DEBUG":
+    logging.getLogger("pymodbus").setLevel(logging.CRITICAL)
+
+try:
+    TZ = ZoneInfo(Config.TIMEZONE)
+except Exception:
+    log.warning("Unbekannte Zeitzone %r, verwende UTC", Config.TIMEZONE)
+    TZ = ZoneInfo("UTC")
+
+INVERTER_STATUS_LABELS = {
+    1: "Off",
+    2: "Sleeping",
+    3: "Starting",
+    4: "Producing",
+    5: "Producing (Throttled)",
+    6: "Shutting Down",
+    7: "Fault",
+    8: "Standby",
+}
+
+
+def validate_config() -> None:
+    missing = []
+    if not Config.SOLAREDGE_HOST:
+        missing.append("SOLAREDGE_HOST")
+    if not Config.PVOUTPUT_API_KEY:
+        missing.append("PVOUTPUT_API_KEY")
+    if not Config.PVOUTPUT_SYSTEM_ID:
+        missing.append("PVOUTPUT_SYSTEM_ID")
+    if missing:
+        log.error(
+            "Fehlende Pflicht-Umgebungsvariablen: %s. Bitte .env pruefen.",
+            ", ".join(missing),
+        )
+        sys.exit(1)
+    if Config.INTERVAL_SECONDS < 60:
+        log.warning(
+            "INTERVAL_SECONDS=%s ist sehr niedrig - PVOutput erlaubt "
+            "ohne Donation-Account maximal ein Update alle 5 Minuten.",
+            Config.INTERVAL_SECONDS,
+        )
+
+
+def scaled(values: dict, key: str) -> float:
+    """Wendet den SunSpec-Skalierungsfaktor auf einen rohen Registerwert an."""
+    raw = values.get(key)
+    scale = values.get(f"{key}_scale")
+    if raw is None:
+        return None
+    if not scale:
+        return float(raw)
+    return float(raw) * (10 ** scale)
+
+
+def read_inverter_values() -> dict:
+    """Baut eine frische Modbus-Verbindung auf, liest alle Register und
+    schliesst die Verbindung wieder. Wirft eine Exception bei Fehlern."""
+    inverter = Inverter(
+        host=Config.SOLAREDGE_HOST,
+        port=Config.SOLAREDGE_PORT,
+        timeout=Config.SOLAREDGE_TIMEOUT,
+        unit=Config.SOLAREDGE_UNIT_ID,
+    )
+    try:
+        values = inverter.read_all()
+    finally:
+        try:
+            inverter.disconnect()
+        except Exception:
+            pass
+
+    if not values:
+        raise ModbusIOException("Keine Daten vom Wechselrichter erhalten (leere Antwort)")
+
+    return values
+
+
+def build_pvoutput_payload(values: dict) -> dict:
+    power_ac = scaled(values, "power_ac")
+    energy_total = scaled(values, "energy_total")
+    temperature = scaled(values, "temperature") if Config.INCLUDE_TEMPERATURE else None
+    status_raw = values.get("status")
+
+    if energy_total is None:
+        raise ValueError("energy_total konnte nicht gelesen werden")
+
+    # Negative Momentanleistung (z.B. minimaler Nachtverbrauch des
+    # Wechselrichters) ist fuer PVOutput nicht sinnvoll -> auf 0 clampen.
+    if power_ac is not None and power_ac < 0:
+        power_ac = 0
+
+    voltage = None
+    if Config.INCLUDE_VOLTAGE:
+        for key in ("l1_voltage", "l1n_voltage"):
+            v = scaled(values, key)
+            if v:
+                voltage = v
+                break
+
+    now = datetime.now(TZ)
+    payload = {
+        "d": now.strftime("%Y%m%d"),
+        "t": now.strftime("%H:%M"),
+        "v1": int(round(energy_total)),  # Lifetime-Energie in Wh
+        "c1": 1,  # v1 ist ein Zaehlerstand -> PVOutput berechnet die Differenz
+    }
+    if power_ac is not None:
+        payload["v2"] = int(round(power_ac))
+    if temperature:
+        payload["v5"] = round(temperature, 1)
+    if voltage:
+        payload["v6"] = round(voltage, 1)
+
+    status_label = INVERTER_STATUS_LABELS.get(status_raw, f"unknown ({status_raw})")
+    log.info(
+        "Wechselrichter-Status=%s  Leistung=%sW  Zaehlerstand=%.0fWh%s%s",
+        status_label,
+        payload.get("v2", "?"),
+        energy_total,
+        f"  Temp={payload['v5']}C" if "v5" in payload else "",
+        f"  U={payload['v6']}V" if "v6" in payload else "",
+    )
+    return payload
+
+
+def send_to_pvoutput(payload: dict) -> None:
+    if Config.DRY_RUN:
+        log.info("DRY_RUN aktiv - wuerde an PVOutput senden: %s", payload)
+        return
+
+    headers = {
+        "X-Pvoutput-Apikey": Config.PVOUTPUT_API_KEY,
+        "X-Pvoutput-SystemId": Config.PVOUTPUT_SYSTEM_ID,
+    }
+    resp = requests.post(
+        Config.PVOUTPUT_URL, headers=headers, data=payload, timeout=15
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"PVOutput antwortete mit HTTP {resp.status_code}: {resp.text.strip()}"
+        )
+    log.debug("PVOutput OK: %s", resp.text.strip())
+
+
+class GracefulShutdown:
+    stop = False
+
+    def __init__(self):
+        signal.signal(signal.SIGTERM, self._handle)
+        signal.signal(signal.SIGINT, self._handle)
+
+    def _handle(self, signum, frame):
+        log.info("Signal %s empfangen, beende nach aktuellem Zyklus...", signum)
+        self.stop = True
+
+
+def main() -> None:
+    validate_config()
+    log.info(
+        "Starte solaredge-pvoutput: Inverter=%s:%s (Unit %s), Intervall=%ss, TZ=%s",
+        Config.SOLAREDGE_HOST,
+        Config.SOLAREDGE_PORT,
+        Config.SOLAREDGE_UNIT_ID,
+        Config.INTERVAL_SECONDS,
+        Config.TIMEZONE,
+    )
+    shutdown = GracefulShutdown()
+
+    while not shutdown.stop:
+        cycle_start = time.monotonic()
+        try:
+            values = read_inverter_values()
+            payload = build_pvoutput_payload(values)
+            send_to_pvoutput(payload)
+        except (ConnectionException, ModbusIOException, OSError) as exc:
+            log.warning("Modbus-Verbindung zum Wechselrichter fehlgeschlagen: %s", exc)
+        except ValueError as exc:
+            log.warning("Unvollstaendige Daten vom Wechselrichter: %s", exc)
+        except RuntimeError as exc:
+            log.error("PVOutput-Upload fehlgeschlagen: %s", exc)
+        except Exception:
+            log.exception("Unerwarteter Fehler im Update-Zyklus")
+
+        elapsed = time.monotonic() - cycle_start
+        remaining = max(Config.INTERVAL_SECONDS - elapsed, 1)
+        # In kurzen Schlafintervallen warten, damit SIGTERM zuegig reagiert
+        slept = 0.0
+        while slept < remaining and not shutdown.stop:
+            step = min(1.0, remaining - slept)
+            time.sleep(step)
+            slept += step
+
+    log.info("Beendet.")
+
+
+if __name__ == "__main__":
+    main()
