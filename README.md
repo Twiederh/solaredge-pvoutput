@@ -83,10 +83,16 @@ HA_ENTITY_POWER=sensor.solaredge_ac_power
 HA_ENTITY_ENERGY_TOTAL=sensor.solaredge_lifetime_energy
 HA_ENTITY_TEMPERATURE=sensor.solaredge_temperature
 HA_ENTITY_VOLTAGE=sensor.solaredge_voltage_l1
+HA_ENTITY_STATUS=sensor.solaredge_status
 ```
 
-`HA_ENTITY_ENERGY_TOTAL` is required; the other three are optional (leave
-blank to omit that value from the PVOutput upload).
+`HA_ENTITY_ENERGY_TOTAL` is required; the other four are optional (leave
+blank to omit that value from the PVOutput upload). `HA_ENTITY_STATUS`
+works with either a text state ("Sleeping", "Producing", ...) or a numeric
+SunSpec status code (1-8) - both are recognized automatically. Setting it
+also makes `SKIP_STATUSES` (see below) apply to the Home Assistant source.
+If the status entity is temporarily unavailable, the update is still sent
+(just without a status).
 
 ## Set up PVOutput
 
@@ -150,10 +156,11 @@ To test without actually sending data to PVOutput: set `DRY_RUN=true` and
 restart - values will only be logged.
 
 By default, no update is sent to PVOutput while the inverter reports status
-**Sleeping** (`DATA_SOURCE=modbus` only - typically at night, no point
-uploading 0 W). Configure which statuses get skipped via `SKIP_STATUSES`
-(comma-separated, e.g. `SKIP_STATUSES=Sleeping,Off`); set it to an empty
-value to always upload regardless of status.
+**Sleeping** (typically at night, no point uploading 0 W) - available with
+`DATA_SOURCE=modbus` always, and with `DATA_SOURCE=homeassistant` when
+`HA_ENTITY_STATUS` is set. Configure which statuses get skipped via
+`SKIP_STATUSES` (comma-separated, e.g. `SKIP_STATUSES=Sleeping,Off`); set it
+to an empty value to always upload regardless of status.
 
 ## Configuration options (`.env`)
 
@@ -173,6 +180,7 @@ value to always upload regardless of status.
 | `HA_ENTITY_ENERGY_TOTAL` | - (required) | Entity ID for lifetime energy |
 | `HA_ENTITY_TEMPERATURE` | - (optional) | Entity ID for inverter temperature |
 | `HA_ENTITY_VOLTAGE` | - (optional) | Entity ID for grid voltage |
+| `HA_ENTITY_STATUS` | - (optional) | Entity ID for inverter status (text or numeric); enables `SKIP_STATUSES` for this source |
 | **PVOutput** | | |
 | `PVOUTPUT_API_KEY` | - (required) | PVOutput API key |
 | `PVOUTPUT_SYSTEM_ID` | - (required) | PVOutput system ID |
@@ -180,7 +188,7 @@ value to always upload regardless of status.
 | `INTERVAL_SECONDS` | `300` | Seconds between uploads (PVOutput minimum without donation: 300) |
 | `PVOUTPUT_INCLUDE_TEMPERATURE` | `true` | Include temperature (`v5`) |
 | `PVOUTPUT_INCLUDE_VOLTAGE` | `true` | Include grid voltage (`v6`) |
-| `SKIP_STATUSES` | `Sleeping` | Comma-separated inverter statuses (Modbus only) to skip uploading for |
+| `SKIP_STATUSES` | `Sleeping` | Comma-separated inverter statuses to skip uploading for (Modbus always; HA when `HA_ENTITY_STATUS` is set) |
 | `TZ` | `Europe/Berlin` | Timezone for timestamps and Docker log times |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose Modbus logs |
 | `LOG_LANGUAGE` | `de` | Language of log messages: `de` (German) or `en` (English) |

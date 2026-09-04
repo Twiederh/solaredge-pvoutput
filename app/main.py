@@ -69,6 +69,7 @@ class Config:
     HA_ENTITY_ENERGY_TOTAL = os.environ.get("HA_ENTITY_ENERGY_TOTAL", "").strip()
     HA_ENTITY_TEMPERATURE = os.environ.get("HA_ENTITY_TEMPERATURE", "").strip()
     HA_ENTITY_VOLTAGE = os.environ.get("HA_ENTITY_VOLTAGE", "").strip()
+    HA_ENTITY_STATUS = os.environ.get("HA_ENTITY_STATUS", "").strip()
 
     PVOUTPUT_API_KEY = os.environ.get("PVOUTPUT_API_KEY", "").strip()
     PVOUTPUT_SYSTEM_ID = os.environ.get("PVOUTPUT_SYSTEM_ID", "").strip()
@@ -142,6 +143,9 @@ MESSAGES = {
         "ha_entity_unavailable": "Home-Assistant-Entity %r ist aktuell 'unavailable'/'unknown'",
         "ha_entity_not_numeric": "Home-Assistant-Entity %r liefert keinen Zahlenwert (%r)",
         "ha_request_failed": "Verbindung zu Home Assistant fehlgeschlagen: %s",
+        "ha_status_ignored": (
+            "Status-Entity nicht auswertbar (%s) - Update wird ohne Status gesendet"
+        ),
         "incomplete_data": "Unvollstaendige Daten von der Datenquelle: %s",
         "pvoutput_upload_failed": "PVOutput-Upload fehlgeschlagen: %s",
         "unexpected_error": "Unerwarteter Fehler im Update-Zyklus",
@@ -185,6 +189,9 @@ MESSAGES = {
         "ha_entity_unavailable": "Home Assistant entity %r is currently 'unavailable'/'unknown'",
         "ha_entity_not_numeric": "Home Assistant entity %r did not return a numeric value (%r)",
         "ha_request_failed": "Connection to Home Assistant failed: %s",
+        "ha_status_ignored": (
+            "Status entity could not be read (%s) - sending update without status"
+        ),
         "incomplete_data": "Incomplete data from the data source: %s",
         "pvoutput_upload_failed": "PVOutput upload failed: %s",
         "unexpected_error": "Unexpected error during update cycle",
@@ -357,6 +364,31 @@ def _ha_get_state(entity_id: str) -> tuple:
     return value, unit
 
 
+def _ha_get_raw_state(entity_id: str) -> str:
+    """Liest den rohen (nicht-numerischen) Zustand einer Entity, z.B. fuer
+    einen Text-Sensor wie 'Producing' oder 'Sleeping'."""
+    url = f"{Config.HOMEASSISTANT_URL}/api/states/{entity_id}"
+    headers = {
+        "Authorization": f"Bearer {Config.HOMEASSISTANT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=Config.HOMEASSISTANT_TIMEOUT)
+    except requests.RequestException as exc:
+        raise DataSourceError(MSG["ha_request_failed"] % exc) from exc
+
+    if resp.status_code == 404:
+        raise DataSourceError(MSG["ha_entity_not_found"] % entity_id)
+    if resp.status_code != 200:
+        raise DataSourceError(MSG["ha_http_error"] % (entity_id, resp.status_code))
+
+    data = resp.json()
+    state = data.get("state")
+    if state in (None, "unknown", "unavailable"):
+        raise DataSourceError(MSG["ha_entity_unavailable"] % entity_id)
+    return str(state)
+
+
 def _ha_to_watts(value: float, unit: str) -> float:
     u = unit.strip().lower()
     if u == "kw":
@@ -401,12 +433,28 @@ def read_values_homeassistant() -> dict:
         value, _unit = _ha_get_state(Config.HA_ENTITY_VOLTAGE)
         voltage_v = value
 
+    status_label = None
+    if Config.HA_ENTITY_STATUS:
+        # Eine fehlende/kaputte Status-Entity soll das Update nicht komplett
+        # verhindern - Leistung/Energie sind wichtiger als der Status, daher
+        # hier nur loggen statt DataSourceError durchzureichen.
+        try:
+            raw_state = _ha_get_raw_state(Config.HA_ENTITY_STATUS)
+            if raw_state.strip().lstrip("-").isdigit():
+                status_label = INVERTER_STATUS_LABELS.get(
+                    int(raw_state), f"unknown ({raw_state})"
+                )
+            else:
+                status_label = raw_state
+        except DataSourceError as exc:
+            log.warning(MSG["ha_status_ignored"], exc)
+
     return {
         "power_w": power_w,
         "energy_wh": energy_wh,
         "temperature_c": temperature_c,
         "voltage_v": voltage_v,
-        "status_label": None,
+        "status_label": status_label,
     }
 
 
